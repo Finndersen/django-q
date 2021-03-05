@@ -257,3 +257,24 @@ def decode_results(values):
         # decode values in 1.7
         return [dbsafe_decode(v) for v in values]
     return values
+
+
+class Cluster(models.Model):
+    """
+    Model representing an active Django-Q Cluster
+    """
+    id = models.CharField(max_length=36, primary_key=True, editable=False)
+    start_time = models.DateTimeField(default=timezone.now)
+    heartbeat_time = models.DateTimeField(default=timezone.now)
+    hostname = models.CharField(max_length=200)
+    pid = models.IntegerField(verbose_name='Process ID')
+
+
+class Worker(models.Model):
+    """
+    Model representing an active Django-Q Worker
+    """
+    id = models.CharField(max_length=36, primary_key=True, editable=False)
+    cluster = models.ForeignKey(Cluster, on_delete=models.CASCADE)
+    pid = models.IntegerField(verbose_name='Process ID')
+    start_time = models.DateTimeField(default=timezone.now)

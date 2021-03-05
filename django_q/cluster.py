@@ -24,6 +24,7 @@ except core.exceptions.AppRegistryNotReady:
 from django.conf import settings
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from datetime import timedelta
 
 # Local
 import django_q.tasks
@@ -38,11 +39,12 @@ from django_q.conf import (
     resource,
 )
 from django_q.humanhash import humanize
-from django_q.models import Task, Success, Schedule
+from django_q.models import Task, Success, Schedule, Cluster as ClusterModel, Worker as WorkerModel
 from django_q.queues import Queue
 from django_q.signals import pre_execute
 from django_q.signing import SignedPackage, BadSignature
 from django_q.status import Stat, Status
+from django_q.tasks import get_task_representation
 
 
 class Cluster:
@@ -76,6 +78,13 @@ class Cluster:
         logger.info(_(f"Q Cluster {self.name} starting."))
         while not self.start_event.is_set():
             sleep(0.1)
+        # Create cluster instance
+        ClusterModel.objects.create(
+            id=self.cluster_id,
+            start_time=timezone.now(),
+            hostname=self.host,
+            pid=self.pid
+        )
         return self.pid
 
     def stop(self) -> bool:
@@ -87,6 +96,8 @@ class Cluster:
         logger.info(_(f"Q Cluster {self.name} has stopped."))
         self.start_event = None
         self.stop_event = None
+        # Delete cluster instance (will also remove associated workers)
+        ClusterModel.objects.filter(id=self.cluster_id).delete()
         return True
 
     def sig_handler(self, signum, frame):
@@ -144,6 +155,7 @@ class Sentinel:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         self.pid = current_process().pid
         self.cluster_id = cluster_id
+        self.cluster_model = ClusterModel.objects.get(id=cluster_id)
         self.parent_pid = get_ppid()
         self.name = current_process().name
         self.broker = broker or get_broker()
@@ -185,49 +197,61 @@ class Sentinel:
         """
         :type target: function or class
         """
-        p = Process(target=target, args=args)
-        p.daemon = True
-        if target == worker:
-            p.daemon = Conf.DAEMONIZE_WORKERS
-            p.timer = args[2]
-            self.pool.append(p)
+        p = Process(target=target, args=args, daemon=True)
         p.start()
         return p
 
     def spawn_pusher(self) -> Process:
         return self.spawn_process(pusher, self.task_queue, self.event_out, self.broker)
 
-    def spawn_worker(self):
-        self.spawn_process(
-            worker, self.task_queue, self.result_queue, Value("f", -1), self.timeout
-        )
-
     def spawn_monitor(self) -> Process:
         return self.spawn_process(monitor, self.result_queue, self.broker)
 
-    def reincarnate(self, process):
+    def spawn_worker(self):
+        """
+        Specialised process spawning logic for worker
+        """
+        p = WorkerProcess(self.cluster_id, self.task_queue, self.result_queue, self.timeout)
+        self.pool.append(p)
+        p.start()
+        return p
+
+    def reincarnate_monitor(self):
+        """
+        Reincarnate monitor process
+        """
+        close_old_django_connections()
+        self.monitor = self.spawn_monitor()
+        logger.error(_(f"reincarnated monitor {self.monitor.name} after sudden death"))
+        self.reincarnations += 1
+
+    def reincarnate_pusher(self):
+        """
+        Reincarnate pusher process
+        """
+        close_old_django_connections()
+        self.pusher = self.spawn_pusher()
+        logger.error(_(f"reincarnated pusher {self.pusher.name} after sudden death"))
+        self.reincarnations += 1
+
+    def reincarnate_worker(self, process):
         """
         :param process: the process to reincarnate
         :type process: Process or None
         """
         close_old_django_connections()
-        if process == self.monitor:
-            self.monitor = self.spawn_monitor()
-            logger.error(_(f"reincarnated monitor {process.name} after sudden death"))
-        elif process == self.pusher:
-            self.pusher = self.spawn_pusher()
-            logger.error(_(f"reincarnated pusher {process.name} after sudden death"))
+        self.pool.remove(process)
+        # Delete Worker model entry
+        WorkerModel.objects.filter(id=process.id).delete()
+        self.spawn_worker()
+        if process.timer.value == 0:
+            # only need to terminate on timeout, otherwise we risk destabilizing the queues
+            process.terminate()
+            logger.warning(_(f"reincarnated worker {process.name} after timeout"))
+        elif int(process.timer.value) == -2:
+            logger.info(_(f"recycled worker {process.name}"))
         else:
-            self.pool.remove(process)
-            self.spawn_worker()
-            if process.timer.value == 0:
-                # only need to terminate on timeout, otherwise we risk destabilizing the queues
-                process.terminate()
-                logger.warning(_(f"reincarnated worker {process.name} after timeout"))
-            elif int(process.timer.value) == -2:
-                logger.info(_(f"recycled worker {process.name}"))
-            else:
-                logger.error(_(f"reincarnated worker {process.name} after death"))
+            logger.error(_(f"reincarnated worker {process.name} after death"))
 
         self.reincarnations += 1
 
@@ -261,24 +285,36 @@ class Sentinel:
             # Check Workers
             for p in self.pool:
                 with p.timer.get_lock():
-                    # Are you alive?
+                    # Check if worker is alive or timed out
                     if not p.is_alive() or p.timer.value == 0:
-                        self.reincarnate(p)
+                        self.reincarnate_worker(p)
                         continue
                     # Decrement timer if work is being done
                     if p.timer.value > 0:
-                        p.timer.value -= cycle
+                        p.timer.value = 0 if p.timer.value < cycle else p.timer.value - cycle
             # Check Monitor
             if not self.monitor.is_alive():
-                self.reincarnate(self.monitor)
+                self.reincarnate_monitor()
             # Check Pusher
             if not self.pusher.is_alive():
-                self.reincarnate(self.pusher)
-            # Call scheduler once a minute (or so)
+                self.reincarnate_pusher()
+
             counter += cycle
-            if counter >= 30 and Conf.SCHEDULER:
+            # Run every 30 seconds
+            if counter >= 30:
+                # Update cluster heartbeat time
+                now_time = timezone.now()
+                self.cluster_model.heartbeat_time = now_time
+                self.cluster_model.save(update_fields=['heartbeat_time'])
+
+                # Clean up other cluster instances that have died
+                self.cluster_model.filter(heartbeat_time__lt=now_time - timedelta(minutes=1)).delete()
+
+                # Call scheduler
+                if Conf.SCHEDULER:
+                    scheduler(broker=self.broker)
+
                 counter = 0
-                scheduler(broker=self.broker)
             # Save current status
             Stat(self).save()
             sleep(cycle)
@@ -323,6 +359,18 @@ class Sentinel:
             count += 1
         # Final status
         Stat(self).save()
+
+
+class WorkerProcess(Process):
+    """
+    Custom process class for Worker
+    """
+    def __init__(self, cluster_id, task_queue, result_queue, timeout):
+        self.timer = Value("f", -1)
+        self.id = str(uuid.uuid4())
+        super().__init__(target=worker,
+                         args=(self.id, cluster_id, task_queue, result_queue, self.timer, timeout),
+                         daemon=Conf.DAEMONIZE_WORKERS)
 
 
 def pusher(task_queue: Queue, event: Event, broker: Broker = None):
@@ -392,17 +440,26 @@ def monitor(result_queue: Queue, broker: Broker = None):
 
 
 def worker(
-    task_queue: Queue, result_queue: Queue, timer: Value, timeout: int = Conf.TIMEOUT
+    id: str, cluster_id: str, task_queue: Queue, result_queue: Queue, timer: Value, timeout: int = Conf.TIMEOUT
 ):
     """
     Takes a task from the task queue, tries to execute it and puts the result back in the result queue
     :param timeout: number of seconds wait for a worker to finish.
+    :type id: str
+    :type cluster_id: str
     :type task_queue: multiprocessing.Queue
     :type result_queue: multiprocessing.Queue
     :type timer: multiprocessing.Value
     """
     name = current_process().name
     logger.info(_(f"{name} ready for work at {current_process().pid}"))
+    # Create Worker model
+    model = WorkerModel.objects.create(
+        id=id,
+        cluster_id=cluster_id,
+        pid=current_process().pid,
+        task=None
+    )
     task_count = 0
     if timeout is None:
         timeout = -1
@@ -427,6 +484,9 @@ def worker(
         # We're still going
         if not result:
             close_old_django_connections()
+            # Set worker task details
+            # model.task = get_task_representation(task)
+            # model.save(update_fields=['task'])
             timer_value = task.pop("timeout", timeout)
             # signal execution
             pre_execute.send(sender="django_q", func=f, task=task)
@@ -441,6 +501,9 @@ def worker(
                     error_reporter.report()
                 if task.get("sync", False):
                     raise
+            # Clear task details
+            # model.task = None
+            # model.save(update_fields=['task'])
         with timer.get_lock():
             # Process result
             task["result"] = result[0]

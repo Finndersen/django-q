@@ -76,6 +76,19 @@ def async_task(func, *args, **kwargs):
     return task["id"]
 
 
+def get_task_representation(task):
+    """
+    Get string representation of task, from function and arguments
+    """
+    task_str = '{}('.format(task['func'])
+    task_str += ', '.join(str(arg) for arg in task['args'])
+    if task['args'] and task['kwargs']:
+        task_str += ', '
+    task_str += ', '.join('{}={}'.format(key, value) for key,value in task['kwargs'].items())
+    task_str += ')'
+    return task_str
+
+
 def schedule(func, *args, **kwargs):
     """
     Create a schedule.
