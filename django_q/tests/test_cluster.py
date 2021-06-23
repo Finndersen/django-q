@@ -455,7 +455,7 @@ def test_update_failed(broker):
     task['stopped'] = timezone.now()
     save_task(task, broker)
     saved_task = Task.objects.get(id=task['id'])
-    assert saved_task.stopped > old_stopped
+    assert saved_task.end_time > old_stopped
     # third save - success
     task['stopped'] = timezone.now()
     task['result'] = 'result'

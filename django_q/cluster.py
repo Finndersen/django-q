@@ -464,7 +464,7 @@ def worker(
     if timeout is None:
         timeout = -1
     # Start reading the task queue
-    for task in iter(task_queue.get, "STOP"):
+    for task in iter(task_queue.get, "STOP"):  # Task should be provided as task ID which is then retrieved
         result = None
         timer.value = -1  # Idle
         task_count += 1
@@ -546,7 +546,7 @@ def save_task(task, broker: Broker):
             existing_task = Task.objects.get(id=task["id"], name=task["name"])
             # only update the result if it hasn't succeeded yet
             if not existing_task.success:
-                existing_task.stopped = task["stopped"]
+                existing_task.end_time = task["stopped"]
                 existing_task.result = task["result"]
                 existing_task.success = task["success"]
                 existing_task.attempt_count = existing_task.attempt_count + 1

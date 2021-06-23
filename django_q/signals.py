@@ -6,6 +6,7 @@ from django.utils.translation import gettext_lazy as _
 
 from django_q.conf import logger
 from django_q.models import Task
+from django_q.tasks import import_function
 
 
 @receiver(post_save, sender=Task)
@@ -14,9 +15,7 @@ def call_hook(sender, instance, **kwargs):
         f = instance.hook
         if not callable(f):
             try:
-                module, func = f.rsplit(".", 1)
-                m = importlib.import_module(module)
-                f = getattr(m, func)
+                f = import_function(f)
             except (ValueError, ImportError, AttributeError):
                 logger.error(
                     _(f"malformed return hook '{instance.hook}' for [{instance.name}]")

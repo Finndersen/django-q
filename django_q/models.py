@@ -15,83 +15,88 @@ from picklefield.fields import dbsafe_decode
 # Local
 from django_q.conf import croniter
 from django_q.signing import SignedPackage
+from django_q.choices import Choices
+
+
+class TaskManager(models.Manager):
+    """
+    Custom manager for Tasks
+    """
+
+    def get_task(self, task_id):
+        """
+        Get Task by ID or name
+        """
+        if len(task_id) == 32 and self.get_queryset().filter(id=task_id).exists():
+            return self.get_queryset().get(id=task_id)
+        elif self.get_queryset().filter(name=task_id).exists():
+            return self.get_queryset().get(name=task_id)
+
+    def get_result(self, task_id):
+        """
+        Get Task result by ID or name
+        """
+        return self.get_task(task_id).result
+
+    def get_group_results(self, group_id, failures=False):
+        qs = self.get_group_tasks(group_id, failures=failures).values_list("result", flat=True)
+        return decode_results(qs)
+
+    def get_group_tasks(self, group_id, failures=True):
+        qs = self.get_queryset().filter(group=group_id)
+        if failures:
+            qs = qs.filter(success=False)
+        return qs
+
+    def get_group_count(self, group_id, failures=False):
+        return self.get_group_tasks(group_id, failures=failures).count()
+
+    def delete_group(self, group_id, tasks=False):
+        group_qs = self.get_group_tasks(group_id)
+        if tasks:
+            group_qs.delete()
+        else:
+            group_qs.update(group=None)
 
 
 class Task(models.Model):
+    STATUS_CHOICES = Choices(
+        ('pending', 'Pending'),
+        ('running', 'Running'),
+        ('success', 'Success'),
+        ('failed', 'Failed')
+    )
+
     id = models.CharField(max_length=32, primary_key=True, editable=False)
-    name = models.CharField(max_length=100, editable=False)
-    func = models.CharField(max_length=256)
-    hook = models.CharField(max_length=256, null=True)
-    args = PickledObjectField(null=True, protocol=-1)
-    kwargs = PickledObjectField(null=True, protocol=-1)
-    result = PickledObjectField(null=True, protocol=-1)
-    group = models.CharField(max_length=100, editable=False, null=True)
-    started = models.DateTimeField(editable=False)
-    stopped = models.DateTimeField(editable=False)
-    success = models.BooleanField(default=True, editable=False)
+    name = models.CharField(max_length=100, editable=False) #TODO Is this needed..?
+    func = models.CharField(max_length=256, help_text='Reference to task function')
+    hook = models.CharField(max_length=256, null=True,
+                            help_text='Function to call after task completes (passed Task instance)')
+    args = PickledObjectField(null=True, protocol=-1, help_text='Positional arguments provided to function')
+    kwargs = PickledObjectField(null=True, protocol=-1, help_text='Keyword arguments provided to function')
+    result = PickledObjectField(null=True, protocol=-1, help_text="Return value of task function")
+    group = models.CharField(max_length=100, editable=False, null=True,
+                             help_text="Task group, so results for related tasks can be grouped together")
+    cluster_type = models.CharField(max_length=80, null=True,
+                                    help_text='Allows specifying which clusters this task can run on')
+    created_time = models.DateTimeField(editable=False, help_text='Time task was first created')
+    start_time = models.DateTimeField(editable=False, help_text='Start time of most recent task execution')
+    duration = models.IntegerField(editable=False, help_text='Duration of most recent task execution')
+    status = models.CharField(choices=STATUS_CHOICES, default=STATUS_CHOICES.pending, editable=False)
     attempt_count = models.IntegerField(default=0)
 
-    @staticmethod
-    def get_result(task_id):
-        if len(task_id) == 32 and Task.objects.filter(id=task_id).exists():
-            return Task.objects.get(id=task_id).result
-        elif Task.objects.filter(name=task_id).exists():
-            return Task.objects.get(name=task_id).result
-
-    @staticmethod
-    def get_result_group(group_id, failures=False):
-        if failures:
-            values = Task.objects.filter(group=group_id).values_list(
-                "result", flat=True
-            )
-        else:
-            values = (
-                Task.objects.filter(group=group_id)
-                .exclude(success=False)
-                .values_list("result", flat=True)
-            )
-        return decode_results(values)
+    objects = TaskManager()
 
     def group_result(self, failures=False):
         if self.group:
-            return self.get_result_group(self.group, failures)
-
-    @staticmethod
-    def get_group_count(group_id, failures=False):
-        if failures:
-            return Failure.objects.filter(group=group_id).count()
-        return Task.objects.filter(group=group_id).count()
+            return self.objects.get_group_results(self.group, failures)
 
     def group_count(self, failures=False):
         if self.group:
-            return self.get_group_count(self.group, failures)
-
-    @staticmethod
-    def delete_group(group_id, objects=False):
-        group = Task.objects.filter(group=group_id)
-        if objects:
-            return group.delete()
-        return group.update(group=None)
-
-    def group_delete(self, tasks=False):
-        if self.group:
-            return self.delete_group(self.group, tasks)
-
-    @staticmethod
-    def get_task(task_id):
-        if len(task_id) == 32 and Task.objects.filter(id=task_id).exists():
-            return Task.objects.get(id=task_id)
-        elif Task.objects.filter(name=task_id).exists():
-            return Task.objects.get(name=task_id)
-
-    @staticmethod
-    def get_task_group(group_id, failures=True):
-        if failures:
-            return Task.objects.filter(group=group_id)
-        return Task.objects.filter(group=group_id).exclude(success=False)
+            return self.objects.get_group_count(self.group, failures)
 
     def time_taken(self):
-        return (self.stopped - self.started).total_seconds()
+        return (self.end_time - self.start_time).total_seconds()
 
     @property
     def short_result(self):
@@ -105,7 +110,7 @@ class Task(models.Model):
         ordering = ["-stopped"]
 
 
-class SuccessManager(models.Manager):
+class SuccessManager(TaskManager):
     def get_queryset(self):
         return super(SuccessManager, self).get_queryset().filter(success=True)
 
@@ -121,7 +126,7 @@ class Success(Task):
         proxy = True
 
 
-class FailureManager(models.Manager):
+class FailureManager(TaskManager):
     def get_queryset(self):
         return super(FailureManager, self).get_queryset().filter(success=False)
 
@@ -268,6 +273,7 @@ class Cluster(models.Model):
     heartbeat_time = models.DateTimeField(default=timezone.now)
     hostname = models.CharField(max_length=200)
     pid = models.IntegerField(verbose_name='Process ID')
+    cluster_type = models.CharField(max_length=80, null=True)
 
 
 class Worker(models.Model):
@@ -278,3 +284,4 @@ class Worker(models.Model):
     cluster = models.ForeignKey(Cluster, on_delete=models.CASCADE)
     pid = models.IntegerField(verbose_name='Process ID')
     start_time = models.DateTimeField(default=timezone.now)
+    task = models.ForeignKey(Task, on_delete=models.SET_NULL, null=True)

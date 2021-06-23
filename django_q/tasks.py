@@ -1,6 +1,7 @@
 """Provides task functionality."""
 # Standard
 from time import sleep, time
+import importlib
 
 # django
 from django.db import IntegrityError
@@ -17,34 +18,49 @@ from django_q.signals import pre_enqueue
 from django_q.signing import SignedPackage
 
 
-def async_task(func, *args, **kwargs):
-    """Queue a task for the cluster."""
+def async_task(func, *pos_args, args=None, kwargs=None, name=None, hook=None, group=None, timeout=None, **q_options):
+    """
+    Queue a task for the cluster.
+    :param func: Callable function object or string representation of module.function
+    :param pos_args: Positional arguments to provide to func
+    :param args: Positional arguments to provide to func
+    :param kwargs: Keyword arguments to provide to func
+    :param name: Optional custom name of task
+    :param hook: Function to call after task complete (provided Task instance as argument)
+    :param str group: Group identifier (to correlate related tasks)
+    """
+    func = validate_function(func)
+    hook = validate_function(hook)
+
+    args = tuple(pos_args or args or tuple())
+
     keywords = kwargs.copy()
     opt_keys = (
         "hook",
         "group",
         "save",
-        "sync",
-        "cached",
-        "ack_failure",
-        "iter_count",
-        "iter_cached",
-        "chain",
-        "broker",
+        "sync",  # Whether to run the task synchronously
+        "cached",   # Remove
+        "ack_failure",  # Causes failed tasks to still mark status as complete
+        "iter_count", # Remove
+        "iter_cached", # Remove
+        "chain",  # Use prerequisite instead of chain
+        "broker",  # dont need
         "timeout",
     )
     q_options = keywords.pop("q_options", {})
     # get an id
     tag = uuid()
-    # build the task package
-    task = {
-        "id": tag[1],
-        "name": keywords.pop("task_name", None)
-        or q_options.pop("task_name", None)
-        or tag[0],
-        "func": func,
-        "args": args,
-    }
+    # Create task instance
+    task = Task.objects.create(
+        id=tag[1],
+        name=name or tag[0],
+        func=func,
+        args=args,
+        kwargs=kwargs,
+        hook=hook,
+        group=group,
+    )
     # push optionals
     for key in opt_keys:
         if q_options and key in q_options:
@@ -74,6 +90,35 @@ def async_task(func, *args, **kwargs):
     logger.info(f"Enqueued {enqueue_id}")
     logger.debug(f"Pushed {tag}")
     return task["id"]
+
+
+def validate_function(func):
+    """
+    Converts function to string representation, or validates it is valid function if already a string
+    """
+    if isinstance(func, str):
+        # Verify function is valid
+        import_function(func)
+    elif func is not None:
+        # Convert function to string representation
+        func = function_to_string(func)
+    return func
+
+
+def function_to_string(func):
+    """
+    Convert callable to module.path.func string representation
+    """
+    return '{}.{}'.format(func.__module__, func.__name__)
+
+
+def import_function(func_str):
+    """
+    Convert module.path.func string representation to callable object
+    """
+    module, func = func_str.rsplit(".", 1)
+    m = importlib.import_module(module)
+    return getattr(m, func)
 
 
 def get_task_representation(task):
@@ -153,7 +198,7 @@ def result(task_id, wait=0, cached=Conf.CACHED):
         return result_cached(task_id, wait)
     start = time()
     while True:
-        r = Task.get_result(task_id)
+        r = Task.objects.get_result(task_id)
         if r:
             return r
         if (time() - start) * 1000 >= wait >= 0:
@@ -200,7 +245,7 @@ def result_group(group_id, failures=False, wait=0, count=None, cached=Conf.CACHE
                 break
             sleep(0.01)
     while True:
-        r = Task.get_result_group(group_id, failures)
+        r = Task.objects.get_group_results(group_id, failures)
         if r:
             return r
         if (time() - start) * 1000 >= wait >= 0:
@@ -254,7 +299,7 @@ def fetch(task_id, wait=0, cached=Conf.CACHED):
         return fetch_cached(task_id, wait)
     start = time()
     while True:
-        t = Task.get_task(task_id)
+        t = Task.objects.get_task(task_id)
         if t:
             return t
         if (time() - start) * 1000 >= wait >= 0:
@@ -312,7 +357,7 @@ def fetch_group(group_id, failures=True, wait=0, count=None, cached=Conf.CACHED)
                 break
             sleep(0.01)
     while True:
-        r = Task.get_task_group(group_id, failures)
+        r = Task.objects.get_group_tasks(group_id, failures)
         if r:
             return r
         if (time() - start) * 1000 >= wait >= 0:
@@ -375,7 +420,7 @@ def count_group(group_id, failures=False, cached=Conf.CACHED):
     """
     if cached:
         return count_group_cached(group_id, failures)
-    return Task.get_group_count(group_id, failures)
+    return Task.objects.get_group_count(group_id, failures)
 
 
 def count_group_cached(group_id, failures=False, broker=None):
@@ -408,7 +453,7 @@ def delete_group(group_id, tasks=False, cached=Conf.CACHED):
     """
     if cached:
         return delete_group_cached(group_id)
-    return Task.delete_group(group_id, tasks)
+    return Task.objects.delete_group(group_id, tasks)
 
 
 def delete_group_cached(group_id, broker=None):
